@@ -1,0 +1,36 @@
+{
+  "name": "Approvals Viewer for Azure DevOps",
+  "version": "0.5",
+  "description": "View pending Azure DevOps approvals across projects, including approvals waiting for you.",
+  "permissions": [
+    "storage"
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "action": {
+    "default_title": "View Azure DevOps approvals",
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png"
+    },
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "host_permissions": [
+    "https://vsrm.dev.azure.com/*",
+    "https://dev.azure.com/*"
+  ],
+  "manifest_version": 3,
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "{1e185587-2f3b-4eee-9d8b-3a9825aa0eca}"
+    }
+  }
+}

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Approvals Viewer for Azure DevOps - Settings</title>
+<style>
+body {
+  margin: 0;
+  padding: 24px;
+  font-family: "Segoe UI", sans-serif;
+  background: #fff;
+  color: #222;
+}
+
+.wrap {
+  max-width: 720px;
+}
+
+h1 {
+  margin: 0 0 16px 0;
+  font-size: 20px;
+}
+
+p {
+  margin: 0 0 16px 0;
+  color: #555;
+}
+
+.field {
+  margin-bottom: 14px;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+input[type="text"] {
+  width: 100%;
+  max-width: 420px;
+  font-size: 14px;
+  padding: 7px 8px;
+  border: 1px solid #cfcfcf;
+  border-radius: 4px;
+}
+
+.button-row {
+  margin-top: 16px;
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  border: 1px solid #bdbdbd;
+  background: #fff;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #f4f4f4;
+}
+
+.status {
+  margin-top: 12px;
+  min-height: 18px;
+  color: #0a5f00;
+}
+
+.error {
+  color: #b00020;
+}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Extension Settings</h1>
+    <p>Set your Azure DevOps organization and API version. Organization is required.</p>
+
+    <div class="field">
+      <label for="orgInput">Organization</label>
+      <input id="orgInput" type="text" placeholder="e.g. your-organization">
+    </div>
+
+    <div class="field">
+      <label for="apiVersionInput">API Version</label>
+      <input id="apiVersionInput" type="text" placeholder="e.g. 7.1-preview">
+    </div>
+
+    <div class="button-row">
+      <button id="saveButton" type="button">Save</button>
+      <button id="resetButton" type="button">Reset Default</button>
+    </div>
+
+    <div class="status" id="statusMessage"></div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
