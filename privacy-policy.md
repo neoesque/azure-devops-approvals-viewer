@@ -28,7 +28,7 @@ Data is used only to:
 
 ## 5. Data Storage
 - User configuration (`org`, `apiVersion`) is stored locally using browser extension storage.
-- Approval data is processed in-memory for display.
+- The last loaded approval list is cached locally using browser extension storage so the popup can display recent results without reloading every time.
 - The Extension does not persist approval records to developer-controlled servers.
 
 ## 6. Data Sharing
@@ -52,7 +52,7 @@ We may update this policy from time to time. The latest version will be publishe
 **https://neoesque.github.io/azure-devops-approvals-viewer/privacy-policy.html**
 
 ## 11. Effective Date
-Effective date: **2026-06-10**
+Effective date: **2026-07-14**
 
 ## 12. Microsoft Affiliation
 The Extension is an independent tool. It is not affiliated with, endorsed by, or sponsored by Microsoft.
