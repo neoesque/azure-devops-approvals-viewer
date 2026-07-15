@@ -10,6 +10,7 @@ approvals across projects, including approvals waiting for you.
 - Highlight approvals assigned to the signed-in user.
 - Open approval pages directly in Azure DevOps.
 - Copy approval URLs for sharing.
+- Show the last loaded approval list immediately and refresh on demand.
 - Configure the Azure DevOps organization and API version.
 
 ## Install from Source
@@ -27,13 +28,17 @@ to the configured organization.
 
 The extension requests access only to:
 
-- `storage`: Stores the configured organization name and API version locally.
+- `storage`: Stores the configured organization name, API version, and last
+  loaded approval list locally.
+- `scripting`: Runs a temporary fetch helper inside Azure DevOps pages when
+  Azure DevOps requires its own browser session service worker to attach
+  authorization.
 - `https://dev.azure.com/*`: Retrieves projects, user identity, and Pipeline
   approvals.
 - `https://vsrm.dev.azure.com/*`: Retrieves Release approvals.
 
-Approval data is processed locally in the browser and is not sent to
-developer-controlled servers.
+Approval data is processed and cached locally in the browser and is not sent
+to developer-controlled servers.
 
 ## Privacy
 

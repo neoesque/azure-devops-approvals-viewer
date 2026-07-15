@@ -3,13 +3,22 @@ const DEFAULT_CONFIG = {
   apiVersion: "7.1-preview"
 };
 const STORAGE_KEYS = ["org", "apiVersion"];
+const APPROVALS_CACHE_KEY = "approvalsCache";
 const DEFAULT_HEADERS = { Accept: "application/json" };
 const REQUEST_CONCURRENCY = 6;
 const MY_APPROVALS_TAB_ID = "my-approvals";
+const AUTH_BRIDGE_TAB_LOAD_TIMEOUT_MS = 15000;
+const AUTH_BRIDGE_SERVICE_WORKER_WAIT_MS = 5000;
+const AUTH_BRIDGE_POLL_INTERVAL_MS = 250;
+const NAVIGATION_FETCH_TIMEOUT_MS = 30000;
 
 const ext = typeof browser !== "undefined" ? browser : chrome;
 let appConfig = null;
 let currentUserId = null;
+let currentMyApprovalUrls = [];
+let renderedAt = null;
+const authBridgeTabs = new Map();
+let navigationFetchQueue = Promise.resolve();
 
 function h(tag, attributes = {}, ...children) {
   const el = document.createElement(tag);
@@ -75,6 +84,29 @@ function storageGet(keys) {
   });
 }
 
+function storageSet(items) {
+  const storage = ext.storage.local;
+  try {
+    const maybePromise = storage.set(items);
+    if (maybePromise && typeof maybePromise.then === "function") {
+      return maybePromise;
+    }
+  } catch (err) {
+    console.error(err);
+  }
+
+  return new Promise((resolve, reject) => {
+    storage.set(items, () => {
+      const err = runtimeLastErrorMessage();
+      if (err) {
+        reject(new Error(err));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
 async function loadConfig() {
   const stored = await storageGet(STORAGE_KEYS);
   return {
@@ -83,13 +115,44 @@ async function loadConfig() {
   };
 }
 
+function isCacheForCurrentConfig(cache) {
+  return Boolean(
+    cache &&
+      cache.org === appConfig.org &&
+      cache.apiVersion === appConfig.apiVersion &&
+      Number.isFinite(cache.savedAt) &&
+      Array.isArray(cache.results)
+  );
+}
+
+async function loadApprovalsCache() {
+  const stored = await storageGet([APPROVALS_CACHE_KEY]);
+  const cache = stored[APPROVALS_CACHE_KEY];
+  if (!isCacheForCurrentConfig(cache)) {
+    return null;
+  }
+  return cache;
+}
+
+async function saveApprovalsCache(results, savedAt) {
+  await storageSet({
+    [APPROVALS_CACHE_KEY]: {
+      org: appConfig.org,
+      apiVersion: appConfig.apiVersion,
+      savedAt,
+      results
+    }
+  });
+}
+
 function updateOrgLabel() {
   const label = document.getElementById("orgLabel");
   if (!label || !appConfig) {
     return;
   }
   const orgText = appConfig.org ? appConfig.org : "(not set)";
-  label.textContent = `Org: ${orgText} | API: ${appConfig.apiVersion}`;
+  const loadedText = renderedAt ? ` | Last: ${new Date(renderedAt).toLocaleString()}` : "";
+  label.textContent = `Org: ${orgText} | API: ${appConfig.apiVersion}${loadedText}`;
 }
 
 function openOptionsPage() {
@@ -110,6 +173,58 @@ async function copyToClipboard(text) {
   }
 }
 
+function createBackgroundTab(url) {
+  const createProperties = { url, active: false };
+  if (typeof browser !== "undefined" && browser.tabs && browser.tabs.create) {
+    return browser.tabs.create(createProperties);
+  }
+
+  if (ext && ext.tabs && ext.tabs.create) {
+    return new Promise((resolve, reject) => {
+      ext.tabs.create(createProperties, (tab) => {
+        const err = runtimeLastErrorMessage();
+        if (err) {
+          reject(new Error(err));
+          return;
+        }
+        resolve(tab);
+      });
+    });
+  }
+
+  const openedWindow = window.open(url, "_blank");
+  if (!openedWindow) {
+    return Promise.reject(new Error("Unable to open tab."));
+  }
+  return Promise.resolve(openedWindow);
+}
+
+async function openUrlsInBackground(urls) {
+  let openedCount = 0;
+  let errorCount = 0;
+
+  for (const url of urls) {
+    try {
+      await createBackgroundTab(url);
+      openedCount += 1;
+    } catch (err) {
+      console.error("Failed to open approval URL:", url, err);
+      errorCount += 1;
+    }
+  }
+
+  return { openedCount, errorCount };
+}
+
+function setOpenAllStatus(message, isError) {
+  const status = document.getElementById("openAllMyApprovalsStatus");
+  if (!status) {
+    return;
+  }
+  status.textContent = message || "";
+  status.classList.toggle("error", Boolean(isError));
+}
+
 function createLoginRequiredError(url) {
   const err = new Error("需要先登入 Azure DevOps。");
   err.code = "LOGIN_REQUIRED";
@@ -121,14 +236,52 @@ function isLoginRequiredError(err) {
   return Boolean(err && err.code === "LOGIN_REQUIRED");
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { headers: DEFAULT_HEADERS });
+function createHttpError(url, response) {
+  const err = new Error(`HTTP ${response.status} ${url}`);
+  err.status = response.status;
+  err.url = url;
+  return err;
+}
+
+function isSignInRedirect(response) {
+  if (!response || response.status < 300 || response.status >= 400 || !response.headers) {
+    return false;
+  }
+  const location = response.headers.get("location") || "";
+  return location.includes("_signin") || location.includes("login.microsoftonline.com");
+}
+
+function headerEntriesToFacade(entries) {
+  const headers = {};
+  (entries || []).forEach(([name, value]) => {
+    headers[String(name).toLowerCase()] = value;
+  });
+
+  return {
+    get(name) {
+      return headers[String(name).toLowerCase()] || null;
+    }
+  };
+}
+
+function createResponseFacade(fetchResult) {
+  return {
+    ok: fetchResult.ok,
+    status: fetchResult.status,
+    url: fetchResult.url,
+    headers: headerEntriesToFacade(fetchResult.headers)
+  };
+}
+
+async function parseJsonResponse(url, response, bodyText) {
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} ${url}`);
+    if (isSignInRedirect(response)) {
+      throw createLoginRequiredError(url);
+    }
+    throw createHttpError(url, response);
   }
 
   const contentType = (response.headers.get("content-type") || "").toLowerCase();
-  const bodyText = await response.text();
   const looksLikeHtml = contentType.includes("text/html") || /^\s*</.test(bodyText);
   if (looksLikeHtml) {
     throw createLoginRequiredError(url);
@@ -145,6 +298,281 @@ async function fetchJson(url) {
   }
 
   return { data, response };
+}
+
+async function fetchJsonDirect(url) {
+  const response = await fetch(url, {
+    headers: DEFAULT_HEADERS,
+    credentials: "include"
+  });
+
+  const bodyText = await response.text();
+  return parseJsonResponse(url, response, bodyText);
+}
+
+function isReleaseApiUrl(url) {
+  const requestUrl = new URL(url);
+  return (
+    requestUrl.hostname === "vsrm.dev.azure.com" &&
+    requestUrl.pathname.toLowerCase().includes("/_apis/release/approvals")
+  );
+}
+
+function tabsCreate(createProperties) {
+  if (typeof browser !== "undefined" && browser.tabs && browser.tabs.create) {
+    return browser.tabs.create(createProperties);
+  }
+
+  return new Promise((resolve, reject) => {
+    ext.tabs.create(createProperties, (tab) => {
+      const err = runtimeLastErrorMessage();
+      if (err) {
+        reject(new Error(err));
+        return;
+      }
+      resolve(tab);
+    });
+  });
+}
+
+function tabsRemove(tabId) {
+  if (typeof browser !== "undefined" && browser.tabs && browser.tabs.remove) {
+    return browser.tabs.remove(tabId).catch(() => {});
+  }
+
+  return new Promise((resolve) => {
+    ext.tabs.remove(tabId, () => resolve());
+  });
+}
+
+function scriptingExecute(details) {
+  if (typeof browser !== "undefined" && browser.scripting && browser.scripting.executeScript) {
+    return browser.scripting.executeScript(details);
+  }
+
+  return new Promise((resolve, reject) => {
+    ext.scripting.executeScript(details, (results) => {
+      const err = runtimeLastErrorMessage();
+      if (err) {
+        reject(new Error(err));
+        return;
+      }
+      resolve(results || []);
+    });
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getAuthBridgePageUrl(url) {
+  const requestUrl = new URL(url);
+  const encodedOrg = encodeURIComponent(appConfig.org);
+  if (requestUrl.hostname === "vsrm.dev.azure.com") {
+    const pathParts = requestUrl.pathname.split("/").filter(Boolean);
+    const projectPath = pathParts.length > 1 ? `/${pathParts[1]}/_release` : "";
+    return `https://dev.azure.com/${encodedOrg}${projectPath}`;
+  }
+  return `${requestUrl.origin}/${encodedOrg}/`;
+}
+
+function canUseAuthBridge() {
+  return Boolean(
+    ext &&
+      ext.tabs &&
+      ext.tabs.create &&
+      ext.scripting &&
+      ext.scripting.executeScript &&
+      appConfig &&
+      appConfig.org
+  );
+}
+
+async function waitForAuthBridgeTab(tabId) {
+  const deadline = Date.now() + AUTH_BRIDGE_TAB_LOAD_TIMEOUT_MS;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    try {
+      const results = await scriptingExecute({
+        target: { tabId },
+        func: () => document.readyState
+      });
+      const state = results && results[0] ? results[0].result : "";
+      if (state === "interactive" || state === "complete") {
+        return;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+    await delay(AUTH_BRIDGE_POLL_INTERVAL_MS);
+  }
+
+  throw lastError || new Error("Azure DevOps auth bridge tab did not load.");
+}
+
+async function readTabDocument(tabId) {
+  const results = await scriptingExecute({
+    target: { tabId },
+    func: () => ({
+      readyState: document.readyState,
+      url: window.location.href,
+      contentType: document.contentType || "",
+      bodyText: document.body ? document.body.innerText : document.documentElement.innerText
+    })
+  });
+  return results && results[0] ? results[0].result : null;
+}
+
+async function waitForReadableTab(tabId) {
+  const deadline = Date.now() + NAVIGATION_FETCH_TIMEOUT_MS;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    try {
+      const page = await readTabDocument(tabId);
+      if (page && page.readyState === "complete") {
+        return page;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+    await delay(AUTH_BRIDGE_POLL_INTERVAL_MS);
+  }
+
+  throw lastError || new Error("Azure DevOps release API tab did not load.");
+}
+
+async function fetchJsonViaNavigationNow(url) {
+  let tab = null;
+  try {
+    tab = await tabsCreate({ url, active: false });
+    const page = await waitForReadableTab(tab.id);
+    if (!page) {
+      throw new Error(`No response from Azure DevOps release API tab for ${url}`);
+    }
+    if (page.url.includes("_signin") || page.url.includes("login.microsoftonline.com")) {
+      throw createLoginRequiredError(url);
+    }
+
+    return parseJsonResponse(
+      url,
+      {
+        ok: true,
+        status: 200,
+        url: page.url,
+        headers: headerEntriesToFacade([["content-type", page.contentType]])
+      },
+      page.bodyText || ""
+    );
+  } finally {
+    if (tab && tab.id !== undefined) {
+      await tabsRemove(tab.id);
+    }
+  }
+}
+
+function fetchJsonViaNavigation(url) {
+  const result = navigationFetchQueue.then(
+    () => fetchJsonViaNavigationNow(url),
+    () => fetchJsonViaNavigationNow(url)
+  );
+  navigationFetchQueue = result.catch(() => {});
+  return result;
+}
+
+async function getAuthBridgeTabId(url) {
+  const bridgePageUrl = getAuthBridgePageUrl(url);
+
+  if (!authBridgeTabs.has(bridgePageUrl)) {
+    authBridgeTabs.set(
+      bridgePageUrl,
+      tabsCreate({ url: bridgePageUrl, active: false }).then(async (tab) => {
+        await waitForAuthBridgeTab(tab.id);
+        return tab.id;
+      })
+    );
+  }
+
+  return authBridgeTabs.get(bridgePageUrl);
+}
+
+async function closeAuthBridgeTabs() {
+  const tabPromises = Array.from(authBridgeTabs.values());
+  authBridgeTabs.clear();
+  const results = await Promise.allSettled(tabPromises);
+  await Promise.all(
+    results
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => tabsRemove(result.value))
+  );
+}
+
+async function fetchFromAzureDevOpsPage(url, headers, serviceWorkerWaitMs) {
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+      await Promise.race([
+        navigator.serviceWorker.ready.catch(() => null),
+        new Promise((resolve) => setTimeout(resolve, serviceWorkerWaitMs))
+      ]);
+    }
+
+    const response = await fetch(url, {
+      headers,
+      credentials: "include"
+    });
+    const bodyText = await response.text();
+    return {
+      ok: response.ok,
+      status: response.status,
+      url: response.url,
+      headers: Array.from(response.headers.entries()),
+      bodyText
+    };
+  } catch (err) {
+    return {
+      bridgeError: {
+        name: err && err.name ? err.name : "Error",
+        message: err && err.message ? err.message : String(err)
+      }
+    };
+  }
+}
+
+async function fetchJsonWithAuthBridge(url) {
+  if (!canUseAuthBridge()) {
+    throw createLoginRequiredError(url);
+  }
+
+  // Azure DevOps now attaches auth from its own same-origin page context.
+  const tabId = await getAuthBridgeTabId(url);
+  const results = await scriptingExecute({
+    target: { tabId },
+    world: "MAIN",
+    func: fetchFromAzureDevOpsPage,
+    args: [url, DEFAULT_HEADERS, AUTH_BRIDGE_SERVICE_WORKER_WAIT_MS]
+  });
+  const fetchResult = results && results[0] ? results[0].result : null;
+  if (!fetchResult) {
+    throw new Error(`No response from Azure DevOps auth bridge for ${url}`);
+  }
+  if (fetchResult.bridgeError) {
+    throw new Error(
+      `Azure DevOps auth bridge fetch failed for ${url}: ${fetchResult.bridgeError.message}`
+    );
+  }
+  return parseJsonResponse(url, createResponseFacade(fetchResult), fetchResult.bodyText);
+}
+
+async function fetchJson(url) {
+  if (isReleaseApiUrl(url) && canUseAuthBridge()) {
+    return fetchJsonViaNavigation(url);
+  }
+  if (canUseAuthBridge()) {
+    return fetchJsonWithAuthBridge(url);
+  }
+  return fetchJsonDirect(url);
 }
 
 async function fetchCurrentUser() {
@@ -473,6 +901,59 @@ function createApprovalsTable(result) {
   );
 }
 
+function getApprovalUrls(result) {
+  const urls = [];
+
+  result.releaseApprovals.forEach((approval) => {
+    const releaseId = approval.release ? approval.release.id : "";
+    urls.push(generateReleaseWebUrl(result.projectName, releaseId));
+  });
+
+  result.pipelineApprovals.forEach((approval) => {
+    const webUrl = getPipelineWebUrl(approval);
+    if (webUrl && webUrl !== "#") {
+      urls.push(webUrl);
+    }
+  });
+
+  return urls;
+}
+
+function getUniqueUrls(results) {
+  const urls = [];
+  const seen = new Set();
+
+  results.forEach((result) => {
+    getApprovalUrls(result).forEach((url) => {
+      if (!url || seen.has(url)) {
+        return;
+      }
+      seen.add(url);
+      urls.push(url);
+    });
+  });
+
+  return urls;
+}
+
+function createMyApprovalsActions(urlCount) {
+  return h(
+    "div",
+    { className: "my-approvals-actions" },
+    h(
+      "button",
+      {
+        type: "button",
+        className: "toolbar-button",
+        "data-action": "open-all-my-approvals",
+        disabled: urlCount === 0
+      },
+      `背景開啟全部 URL (${urlCount})`
+    ),
+    h("span", { id: "openAllMyApprovalsStatus", className: "open-all-status" }, "")
+  );
+}
+
 function renderProjectContent(result) {
   const container = document.getElementById(result.projectId);
   if (!container) {
@@ -525,6 +1006,7 @@ function renderMyApprovalsContent(results) {
     .map(createMyApprovalsResult)
     .filter((result) => result.count > 0);
   const totalCount = myResults.reduce((total, result) => total + result.count, 0);
+  currentMyApprovalUrls = getUniqueUrls(myResults);
 
   container.appendChild(
     h("div", { className: "project-summary" }, `全部專案共有 ${totalCount} 筆等待你簽核的項目`)
@@ -534,6 +1016,8 @@ function renderMyApprovalsContent(results) {
     container.appendChild(h("div", { className: "status-message" }, "目前沒有等待你簽核的項目。"));
     return;
   }
+
+  container.appendChild(createMyApprovalsActions(currentMyApprovalUrls.length));
 
   myResults.forEach((result) => {
     const section = h("section", { className: "my-approvals-project" });
@@ -594,18 +1078,88 @@ function renderLoginRequiredMessage() {
 function renderLoading() {
   const tabContainer = document.getElementById("tabContainer");
   const contentContainer = document.getElementById("contentContainer");
+  currentMyApprovalUrls = [];
   tabContainer.innerHTML = "";
   contentContainer.innerHTML = "";
   contentContainer.appendChild(h("div", { className: "status-message" }, "Loading approvals..."));
+}
+
+function setRefreshButtonLoading(isLoading) {
+  const refreshButton = document.getElementById("refreshButton");
+  if (!refreshButton) {
+    return;
+  }
+  refreshButton.disabled = isLoading;
+  refreshButton.textContent = isLoading ? "Refreshing..." : "Refresh";
+}
+
+function renderApprovalsResults(projectsWithApprovals, savedAt) {
+  renderedAt = savedAt || Date.now();
+  updateOrgLabel();
+
+  if (projectsWithApprovals.length === 0) {
+    renderNoApprovalsMessage();
+    return;
+  }
+
+  const tabContainer = document.getElementById("tabContainer");
+  const contentContainer = document.getElementById("contentContainer");
+  tabContainer.innerHTML = "";
+  contentContainer.innerHTML = "";
+
+  const totalMyApprovals = projectsWithApprovals.reduce(
+    (total, result) => total + result.myCount,
+    0
+  );
+  tabContainer.appendChild(
+    createProjectTab(MY_APPROVALS_TAB_ID, "等待我簽核", totalMyApprovals, true)
+  );
+  const myApprovalsContainer = createProjectContainer(MY_APPROVALS_TAB_ID);
+  myApprovalsContainer.classList.add("active");
+  contentContainer.appendChild(myApprovalsContainer);
+  renderMyApprovalsContent(projectsWithApprovals);
+
+  projectsWithApprovals.forEach((result) => {
+    tabContainer.appendChild(
+      createProjectTab(result.projectId, result.projectName, result.count, false)
+    );
+    const projectContainer = createProjectContainer(result.projectId);
+    contentContainer.appendChild(projectContainer);
+    renderProjectContent(result);
+  });
+}
+
+async function handleOpenAllMyApprovals(button) {
+  const urls = currentMyApprovalUrls.slice();
+  if (urls.length === 0) {
+    setOpenAllStatus("沒有可開啟的 URL。", true);
+    return;
+  }
+
+  button.disabled = true;
+  setOpenAllStatus(`正在背景開啟 ${urls.length} 個頁籤...`, false);
+
+  const { openedCount, errorCount } = await openUrlsInBackground(urls);
+  button.disabled = false;
+
+  if (errorCount > 0) {
+    setOpenAllStatus(`已開啟 ${openedCount} 個頁籤，${errorCount} 個失敗。`, true);
+    return;
+  }
+  setOpenAllStatus(`已背景開啟 ${openedCount} 個頁籤。`, false);
 }
 
 function setupEvents() {
   const tabContainer = document.getElementById("tabContainer");
   const contentContainer = document.getElementById("contentContainer");
   const openOptionsButton = document.getElementById("openOptionsButton");
+  const refreshButton = document.getElementById("refreshButton");
 
   if (openOptionsButton) {
     openOptionsButton.addEventListener("click", openOptionsPage);
+  }
+  if (refreshButton) {
+    refreshButton.addEventListener("click", () => loadApprovals(true));
   }
 
   tabContainer.addEventListener("click", (e) => {
@@ -625,6 +1179,15 @@ function setupEvents() {
       return;
     }
 
+    if (target.matches('button[data-action="open-all-my-approvals"]')) {
+      handleOpenAllMyApprovals(target).catch((err) => {
+        console.error(err);
+        setOpenAllStatus(`背景開啟失敗: ${err.message}`, true);
+        target.disabled = false;
+      });
+      return;
+    }
+
     if (target.matches('button[data-action="copy"]')) {
       const url = target.dataset.url;
       if (url) {
@@ -635,18 +1198,12 @@ function setupEvents() {
 
     if (target.matches("a.release-link")) {
       e.preventDefault();
-      if (ext && ext.tabs && ext.tabs.create) {
-        ext.tabs.create({ url: target.href, active: false });
-      } else {
-        window.open(target.href, "_blank");
-      }
+      createBackgroundTab(target.href).catch((err) => console.error("Failed to open approval URL:", err));
     }
   });
 }
 
-async function loadApprovals() {
-  renderLoading();
-
+async function loadApprovals(forceRefresh = false) {
   try {
     appConfig = await loadConfig();
     updateOrgLabel();
@@ -654,6 +1211,17 @@ async function loadApprovals() {
       renderFatalError("請先到 Settings 設定 Azure DevOps Organization。");
       return;
     }
+
+    if (!forceRefresh) {
+      const cache = await loadApprovalsCache();
+      if (cache) {
+        renderApprovalsResults(cache.results, cache.savedAt);
+        return;
+      }
+    }
+
+    renderLoading();
+    setRefreshButtonLoading(true);
 
     await fetchCurrentUser();
     const projects = await fetchAllProjects();
@@ -666,35 +1234,19 @@ async function loadApprovals() {
         renderLoginRequiredMessage();
         return;
       }
-      renderNoApprovalsMessage();
+      const savedAt = Date.now();
+      await saveApprovalsCache([], savedAt).catch((err) =>
+        console.error("Failed to save approvals cache:", err)
+      );
+      renderApprovalsResults([], savedAt);
       return;
     }
 
-    const tabContainer = document.getElementById("tabContainer");
-    const contentContainer = document.getElementById("contentContainer");
-    tabContainer.innerHTML = "";
-    contentContainer.innerHTML = "";
-
-    const totalMyApprovals = projectsWithApprovals.reduce(
-      (total, result) => total + result.myCount,
-      0
+    const savedAt = Date.now();
+    await saveApprovalsCache(projectsWithApprovals, savedAt).catch((err) =>
+      console.error("Failed to save approvals cache:", err)
     );
-    tabContainer.appendChild(
-      createProjectTab(MY_APPROVALS_TAB_ID, "等待我簽核", totalMyApprovals, true)
-    );
-    const myApprovalsContainer = createProjectContainer(MY_APPROVALS_TAB_ID);
-    myApprovalsContainer.classList.add("active");
-    contentContainer.appendChild(myApprovalsContainer);
-    renderMyApprovalsContent(projectsWithApprovals);
-
-    projectsWithApprovals.forEach((result) => {
-      tabContainer.appendChild(
-        createProjectTab(result.projectId, result.projectName, result.count, false)
-      );
-      const projectContainer = createProjectContainer(result.projectId);
-      contentContainer.appendChild(projectContainer);
-      renderProjectContent(result);
-    });
+    renderApprovalsResults(projectsWithApprovals, savedAt);
   } catch (err) {
     console.error(err);
     if (isLoginRequiredError(err)) {
@@ -702,6 +1254,9 @@ async function loadApprovals() {
       return;
     }
     renderFatalError(`讀取簽核資料失敗: ${err.message}`);
+  } finally {
+    setRefreshButtonLoading(false);
+    closeAuthBridgeTabs().catch((err) => console.error("Failed to close auth bridge tabs:", err));
   }
 }
 
