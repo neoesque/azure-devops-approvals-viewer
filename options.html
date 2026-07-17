@@ -45,6 +45,11 @@ input[type="text"] {
   border-radius: 4px;
 }
 
+input[type="checkbox"] {
+  margin: 0 8px 0 0;
+  vertical-align: middle;
+}
+
 .button-row {
   margin-top: 16px;
   display: flex;
@@ -86,6 +91,13 @@ button:hover {
     <div class="field">
       <label for="apiVersionInput">API Version</label>
       <input id="apiVersionInput" type="text" placeholder="e.g. 7.1-preview">
+    </div>
+
+    <div class="field">
+      <label for="keepFailedAuthBridgeTabsInput">
+        <input id="keepFailedAuthBridgeTabsInput" type="checkbox">
+        Keep failed Azure DevOps tabs open
+      </label>
     </div>
 
     <div class="button-row">

@@ -74,15 +74,19 @@ function normalizeText(value) {
 }
 
 async function loadSettings() {
-  const stored = await storageGet(["org", "apiVersion"]);
+  const stored = await storageGet(["org", "apiVersion", "keepFailedAuthBridgeTabs"]);
   const orgInput = document.getElementById("orgInput");
   const apiVersionInput = document.getElementById("apiVersionInput");
+  const keepFailedAuthBridgeTabsInput = document.getElementById("keepFailedAuthBridgeTabsInput");
 
   if (orgInput) {
     orgInput.value = normalizeText(stored.org) || DEFAULT_CONFIG.org;
   }
   if (apiVersionInput) {
     apiVersionInput.value = normalizeText(stored.apiVersion) || DEFAULT_CONFIG.apiVersion;
+  }
+  if (keepFailedAuthBridgeTabsInput) {
+    keepFailedAuthBridgeTabsInput.checked = stored.keepFailedAuthBridgeTabs === true;
   }
 }
 
@@ -91,6 +95,9 @@ async function saveSettings() {
   const apiVersionInput = document.getElementById("apiVersionInput");
   const org = normalizeText(orgInput ? orgInput.value : "");
   const apiVersion = normalizeText(apiVersionInput ? apiVersionInput.value : "");
+  const keepFailedAuthBridgeTabs = Boolean(
+    keepFailedAuthBridgeTabsInput && keepFailedAuthBridgeTabsInput.checked
+  );
 
   if (!org) {
     setStatus("Organization 不能為空。", true);
@@ -101,14 +108,15 @@ async function saveSettings() {
     return;
   }
 
-  await storageSet({ org, apiVersion });
+  await storageSet({ org, apiVersion, keepFailedAuthBridgeTabs });
   setStatus("已儲存。", false);
 }
 
 async function resetSettings() {
   await storageSet({
     org: DEFAULT_CONFIG.org,
-    apiVersion: DEFAULT_CONFIG.apiVersion
+    apiVersion: DEFAULT_CONFIG.apiVersion,
+    keepFailedAuthBridgeTabs: false
   });
   await loadSettings();
   setStatus("已恢復預設值。", false);

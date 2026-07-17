@@ -10,8 +10,10 @@ approvals across projects, including approvals waiting for you.
 - Highlight approvals assigned to the signed-in user.
 - Open approval pages directly in Azure DevOps.
 - Copy approval URLs for sharing.
-- Show the last loaded approval list immediately and refresh on demand.
+- Show the last loaded approval list immediately, refresh on demand, and
+  automatically refresh the first time the popup opens each day.
 - Configure the Azure DevOps organization and API version.
+- Optionally keep failed Azure DevOps tabs open for diagnosis.
 
 ## Install from Source
 
@@ -39,6 +41,18 @@ The extension requests access only to:
 
 Approval data is processed and cached locally in the browser and is not sent
 to developer-controlled servers.
+
+## Debug Azure Authentication
+
+When an Azure DevOps request fails, open **Settings**, enable **Keep failed
+Azure DevOps tabs open**, save, then refresh the popup. A failed background tab
+remains open so its final URL and Azure DevOps error page can be inspected. The
+popup DevTools console logs either `[Azure DevOps auth bridge]` or
+`[Azure DevOps release navigation]` with the attempted URL, final URL, title,
+and error. It never logs cookies or authorization tokens.
+
+Turn the option off after diagnosis; failed tabs are otherwise kept for
+manual inspection.
 
 ## Privacy
 
