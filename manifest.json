@@ -1,6 +1,6 @@
 {
   "name": "Approvals Viewer for Azure DevOps",
-  "version": "0.8",
+  "version": "0.9",
   "description": "View pending Azure DevOps approvals across projects, including approvals waiting for you.",
   "permissions": [
     "scripting",

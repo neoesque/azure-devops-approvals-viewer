@@ -27,7 +27,8 @@ Data is used only to:
 - Copy approval URLs when requested by the user
 
 ## 5. Data Storage
-- User configuration (`org`, `apiVersion`) is stored locally using browser extension storage.
+- User configuration (`org`, `apiVersion`) and the failed-tab diagnostic preference are stored locally using browser extension storage.
+- The last known Release project is stored locally to initialize Azure DevOps Release access during refresh.
 - The last loaded approval list is cached locally using browser extension storage so the popup can display recent results without reloading every time.
 - The Extension does not persist approval records to developer-controlled servers.
 
@@ -36,23 +37,28 @@ Data is used only to:
 - The Extension does not transmit approval data to third-party servers controlled by the developer.
 - API requests are sent only to Azure DevOps endpoints configured for extension functionality.
 
-## 7. Security
-The Extension communicates with Azure DevOps over HTTPS and requests only permissions required for functionality.
+## 7. Limited Use
+- Data is accessed only to provide the Extension's approval-viewing features.
+- Data is not used or transferred for advertising, credit assessment, or unrelated analytics.
+- The developer and third parties do not read approval data stored by the Extension.
 
-## 8. User Controls
+## 8. Security
+The Extension communicates with Azure DevOps over HTTPS and requests only permissions required for functionality. It does not read or store passwords, authentication tokens, or login cookies.
+
+## 9. User Controls
 Users can:
 - Change or remove organization/API settings from the extension Options page.
 - Remove the extension at any time from the browser.
 
-## 9. Children
+## 10. Children
 The Extension is not intended for children.
 
-## 10. Changes to This Policy
+## 11. Changes to This Policy
 We may update this policy from time to time. The latest version will be published at:
 **https://neoesque.github.io/azure-devops-approvals-viewer/privacy-policy.html**
 
-## 11. Effective Date
-Effective date: **2026-07-14**
+## 12. Effective Date
+Effective date: **2026-07-22**
 
-## 12. Microsoft Affiliation
+## 13. Microsoft Affiliation
 The Extension is an independent tool. It is not affiliated with, endorsed by, or sponsored by Microsoft.

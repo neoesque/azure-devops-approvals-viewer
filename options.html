@@ -26,6 +26,20 @@ p {
   color: #555;
 }
 
+.data-disclosure {
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border-left: 3px solid #0078d4;
+  background: #f3f8fc;
+  color: #333;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.data-disclosure a {
+  color: #005ea6;
+}
+
 .field {
   margin-bottom: 14px;
 }
@@ -83,6 +97,16 @@ button:hover {
     <h1>Extension Settings</h1>
     <p>Set your Azure DevOps organization and API version. Organization is required.</p>
 
+    <div class="data-disclosure">
+      This extension retrieves your Azure DevOps user identity, project metadata, and
+      approval records to display pending approvals. Configuration, the last known
+      Release project, and recent approval results are stored locally in this browser.
+      Data is sent only to Azure DevOps and is not sent to developer-controlled servers.
+      By selecting <strong>Agree and Save</strong>, you agree to this use.
+      <a href="https://neoesque.github.io/azure-devops-approvals-viewer/privacy-policy.html"
+         target="_blank" rel="noopener">Privacy Policy</a>
+    </div>
+
     <div class="field">
       <label for="orgInput">Organization</label>
       <input id="orgInput" type="text" placeholder="e.g. your-organization">
@@ -101,7 +125,7 @@ button:hover {
     </div>
 
     <div class="button-row">
-      <button id="saveButton" type="button">Save</button>
+      <button id="saveButton" type="button">Agree and Save</button>
       <button id="resetButton" type="button">Reset Default</button>
     </div>
 

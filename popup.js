@@ -5,13 +5,15 @@ const DEFAULT_CONFIG = {
 };
 const STORAGE_KEYS = ["org", "apiVersion", "keepFailedAuthBridgeTabs"];
 const APPROVALS_CACHE_KEY = "approvalsCache";
+const RELEASE_AUTH_PROJECT_KEY = "releaseAuthProject";
 const DEFAULT_HEADERS = { Accept: "application/json" };
 const REQUEST_CONCURRENCY = 6;
 const MY_APPROVALS_TAB_ID = "my-approvals";
 const AUTH_BRIDGE_TAB_LOAD_TIMEOUT_MS = 15000;
 const AUTH_BRIDGE_SERVICE_WORKER_WAIT_MS = 5000;
 const AUTH_BRIDGE_POLL_INTERVAL_MS = 250;
-const NAVIGATION_FETCH_TIMEOUT_MS = 30000;
+const RELEASE_AUTH_BOOTSTRAP_TIMEOUT_MS = 15000;
+const CACHE_STALE_AFTER_MS = 3 * 60 * 60 * 1000;
 
 const ext = typeof browser !== "undefined" ? browser : chrome;
 let appConfig = null;
@@ -20,7 +22,9 @@ let currentMyApprovalUrls = [];
 let renderedAt = null;
 const authBridgeTabs = new Map();
 const preservedAuthBridgeTabIds = new Set();
-let navigationFetchQueue = Promise.resolve();
+let releaseAuthProjectName = "";
+let releaseAuthBootstrapPromise = null;
+let releaseAuthBootstrapProjectName = "";
 
 function h(tag, attributes = {}, ...children) {
   const el = document.createElement(tag);
@@ -146,6 +150,14 @@ function isCacheSavedToday(cache) {
   return Boolean(cache && isSameLocalDate(cache.savedAt, Date.now()));
 }
 
+function isCacheOlderThanThreeHours(savedAt, now = Date.now()) {
+  return (
+    Number.isFinite(savedAt) &&
+    Number.isFinite(now) &&
+    now - savedAt > CACHE_STALE_AFTER_MS
+  );
+}
+
 async function loadApprovalsCache() {
   const stored = await storageGet([APPROVALS_CACHE_KEY]);
   const cache = stored[APPROVALS_CACHE_KEY];
@@ -166,6 +178,57 @@ async function saveApprovalsCache(results, savedAt) {
   });
 }
 
+function findReleaseAuthProject(cache) {
+  if (!cache || !Array.isArray(cache.results)) {
+    return "";
+  }
+
+  const result = cache.results.find(
+    (item) =>
+      item &&
+      typeof item.projectName === "string" &&
+      Array.isArray(item.releaseApprovals) &&
+      item.releaseApprovals.length > 0
+  );
+  return result ? result.projectName.trim() : "";
+}
+
+async function persistReleaseAuthProject(projectName) {
+  await storageSet({
+    [RELEASE_AUTH_PROJECT_KEY]: {
+      org: appConfig.org,
+      projectName
+    }
+  });
+}
+
+async function initializeReleaseAuthProject(cache) {
+  releaseAuthBootstrapPromise = null;
+  releaseAuthBootstrapProjectName = "";
+  releaseAuthProjectName = "";
+
+  const stored = await storageGet([RELEASE_AUTH_PROJECT_KEY]);
+  const saved = stored[RELEASE_AUTH_PROJECT_KEY];
+  if (
+    saved &&
+    saved.org === appConfig.org &&
+    typeof saved.projectName === "string" &&
+    saved.projectName.trim()
+  ) {
+    releaseAuthProjectName = saved.projectName.trim();
+    return;
+  }
+
+  const cachedProjectName = findReleaseAuthProject(cache);
+  if (!cachedProjectName) {
+    return;
+  }
+  releaseAuthProjectName = cachedProjectName;
+  await persistReleaseAuthProject(cachedProjectName).catch((err) =>
+    console.error("Failed to save Azure DevOps Release auth project:", err)
+  );
+}
+
 function updateOrgLabel() {
   const label = document.getElementById("orgLabel");
   if (!label || !appConfig) {
@@ -174,6 +237,45 @@ function updateOrgLabel() {
   const orgText = appConfig.org ? appConfig.org : "(not set)";
   const loadedText = renderedAt ? ` | Last: ${new Date(renderedAt).toLocaleString()}` : "";
   label.textContent = `Org: ${orgText} | API: ${appConfig.apiVersion}${loadedText}`;
+}
+
+function clearNotice(elementId) {
+  const notice = document.getElementById(elementId);
+  if (!notice) {
+    return;
+  }
+  notice.hidden = true;
+  notice.textContent = "";
+}
+
+function updateCacheNotice(savedAt, fromCache) {
+  const notice = document.getElementById("cacheNotice");
+  if (!notice) {
+    return;
+  }
+
+  const isStale = fromCache && isCacheOlderThanThreeHours(savedAt);
+  notice.hidden = !isStale;
+  notice.textContent = isStale
+    ? "目前顯示的是超過 3 小時的快取資料；需要最新狀態時請按 Refresh。"
+    : "";
+}
+
+function renderLoginRequiredNotice() {
+  const notice = document.getElementById("authNotice");
+  if (!notice) {
+    return;
+  }
+
+  const loginUrl = appConfig && appConfig.org
+    ? `https://dev.azure.com/${appConfig.org}/`
+    : "https://dev.azure.com/";
+  const loginLink = h("a", { href: loginUrl, target: "_blank", className: "login-link" }, "登入");
+  notice.innerHTML = "";
+  notice.appendChild(document.createTextNode("需要登入 Azure DevOps，請先"));
+  notice.appendChild(loginLink);
+  notice.appendChild(document.createTextNode("後再按 Refresh。"));
+  notice.hidden = false;
 }
 
 function openOptionsPage() {
@@ -426,11 +528,27 @@ async function waitForAuthBridgeTab(tabId) {
         })
       });
       const page = results && results[0] ? results[0].result : null;
+      if (isAzureDevOpsLoginPage(page)) {
+        const err = createLoginRequiredError(page.url);
+        err.page = page;
+        throw err;
+      }
       if (page && (page.readyState === "interactive" || page.readyState === "complete")) {
         lastPage = page;
         return page;
       }
     } catch (err) {
+      if (isLoginRequiredError(err)) {
+        throw err;
+      }
+      if (
+        isAzureDevOpsLoginReference(err && err.message) ||
+        isTabAccessDeniedError(err)
+      ) {
+        const loginError = createLoginRequiredError("");
+        loginError.page = lastPage;
+        throw loginError;
+      }
       lastError = err;
     }
     await delay(AUTH_BRIDGE_POLL_INTERVAL_MS);
@@ -446,12 +564,30 @@ function isAuthBridgeNotFoundPage(page) {
   return text.includes("page not found") || text.includes("404");
 }
 
+function isAzureDevOpsLoginReference(value) {
+  const text = String(value || "").toLowerCase();
+  return (
+    text.includes("/_signin") ||
+    text.includes("login.microsoftonline.com") ||
+    text.includes("login.live.com")
+  );
+}
+
+function isAzureDevOpsLoginPage(page) {
+  if (!page) {
+    return false;
+  }
+  return isAzureDevOpsLoginReference(page.url);
+}
+
 function createAuthBridgeFailureError(bridgePageUrl, tabId, page, err) {
   const message = err && err.message ? err.message : String(err);
   const failure = new Error(`Azure DevOps auth bridge failed for ${bridgePageUrl}: ${message}`);
   failure.bridgePageUrl = bridgePageUrl;
   failure.tabId = tabId;
-  failure.page = page || null;
+  failure.page = page || (err && err.page) || null;
+  failure.code = err && err.code ? err.code : undefined;
+  failure.status = err && err.status ? err.status : undefined;
   return failure;
 }
 
@@ -464,6 +600,8 @@ function logAuthBridgeFailure(failure) {
     pageTitle: page.title || "",
     readyState: page.readyState || "",
     serviceWorkerControlled: page.serviceWorkerControlled === true,
+    releaseClientReady: page.releaseClientReady === true,
+    releaseClientError: page.releaseClientError || "",
     error: failure.message
   });
 }
@@ -603,12 +741,12 @@ async function fetchJsonWithAuthBridge(url) {
 
   // Azure DevOps now attaches auth from its own same-origin page context.
   const tabId = await getAuthBridgeTabId(url);
-  const results = await scriptingExecute({
+  const results = await executeAuthBridgeScript({
     target: { tabId },
     world: "MAIN",
     func: fetchFromAzureDevOpsPage,
     args: [url, DEFAULT_HEADERS, AUTH_BRIDGE_SERVICE_WORKER_WAIT_MS]
-  });
+  }, url);
   const fetchResult = results && results[0] ? results[0].result : null;
   if (!fetchResult) {
     throw new Error(`No response from Azure DevOps auth bridge for ${url}`);
@@ -630,109 +768,281 @@ function isTabAccessDeniedError(err) {
   );
 }
 
-async function readTabDocument(tabId) {
+async function executeAuthBridgeScript(details, url) {
+  try {
+    return await scriptingExecute(details);
+  } catch (err) {
+    if (
+      isAzureDevOpsLoginReference(err && err.message) ||
+      isTabAccessDeniedError(err)
+    ) {
+      throw createLoginRequiredError(url);
+    }
+    throw err;
+  }
+}
+
+async function readReleaseHubState(tabId) {
   const results = await scriptingExecute({
     target: { tabId },
-    func: () => ({
-      readyState: document.readyState,
-      url: window.location.href,
-      title: document.title || "",
-      contentType: document.contentType || "",
-      bodyText: document.body ? document.body.innerText : document.documentElement.innerText
-    })
+    world: "MAIN",
+    func: () => {
+      let releaseClientReady = false;
+      let releaseClientError = "";
+
+      try {
+        const platformModule = window.require("VSS/Platform");
+        const releaseModule = window.require("Release/Client");
+        const releaseService = platformModule.Context.getService("IReleaseService");
+        const releaseClient = releaseService.pageContext.getRestClient(
+          releaseModule.RestClientRelease.ReleaseClientName
+        );
+        releaseClientReady = typeof releaseClient.getApprovals === "function";
+      } catch (err) {
+        releaseClientError = err && err.message ? err.message : String(err);
+      }
+
+      return {
+        readyState: document.readyState,
+        url: window.location.href,
+        title: document.title || "",
+        bodyText: document.body ? document.body.innerText.slice(0, 500) : "",
+        releaseClientReady,
+        releaseClientError
+      };
+    }
   });
   return results && results[0] ? results[0].result : null;
 }
 
-async function waitForReadableTab(tabId, url) {
-  const deadline = Date.now() + NAVIGATION_FETCH_TIMEOUT_MS;
+async function waitForReleaseAuthBootstrap(tabId) {
+  const deadline = Date.now() + RELEASE_AUTH_BOOTSTRAP_TIMEOUT_MS;
   let lastError = null;
   let lastPage = null;
 
   while (Date.now() < deadline) {
     try {
-      const page = await readTabDocument(tabId);
+      const page = await readReleaseHubState(tabId);
       if (page) {
         lastPage = page;
-        if (page.readyState === "complete") {
+        if (isAzureDevOpsLoginPage(page)) {
+          const err = createLoginRequiredError(page.url);
+          err.page = page;
+          throw err;
+        }
+        if (isAuthBridgeNotFoundPage(page)) {
+          throw new Error("Azure DevOps Release hub page not found.");
+        }
+        if (page.releaseClientError) {
+          lastError = new Error(page.releaseClientError);
+        }
+        if (page.readyState === "complete" && page.releaseClientReady) {
           return page;
         }
       }
     } catch (err) {
+      if (isLoginRequiredError(err)) {
+        throw err;
+      }
       if (isTabAccessDeniedError(err)) {
-        throw createLoginRequiredError(url);
+        throw createLoginRequiredError("");
       }
       lastError = err;
     }
     await delay(AUTH_BRIDGE_POLL_INTERVAL_MS);
   }
 
-  const err = lastError || new Error("Azure DevOps release API tab did not load.");
+  const err = lastError || new Error("Azure DevOps Release authentication did not initialize.");
   err.page = lastPage;
   throw err;
 }
 
-function logReleaseNavigationFailure(url, tabId, page, err) {
-  console.error("[Azure DevOps release navigation]", {
-    url,
-    tabId,
-    finalUrl: page && page.url ? page.url : "",
-    pageTitle: page && page.title ? page.title : "",
-    readyState: page && page.readyState ? page.readyState : "",
-    error: err && err.message ? err.message : String(err)
-  });
+function buildReleaseHubUrl(projectName) {
+  const encodedOrg = encodeURIComponent(appConfig.org);
+  const encodedProject = encodeURIComponent(projectName);
+  return `https://dev.azure.com/${encodedOrg}/${encodedProject}/_release`;
 }
 
-async function fetchJsonViaNavigationNow(url) {
-  let tab = null;
-  let preserveTab = false;
-  let page = null;
+async function bootstrapReleaseAuth(projectName) {
+  const releaseHubUrl = buildReleaseHubUrl(projectName);
+  const tabId = await getAuthBridgeTabIdForPage(releaseHubUrl);
 
   try {
-    tab = await tabsCreate({ url, active: false });
-    page = await waitForReadableTab(tab.id, url);
-    if (!page) {
-      throw new Error(`No response from Azure DevOps release API tab for ${url}`);
-    }
-    if (page.url.includes("_signin") || page.url.includes("login.microsoftonline.com")) {
-      throw createLoginRequiredError(url);
-    }
-
-    return parseJsonResponse(
-      url,
-      {
-        ok: true,
-        status: 200,
-        url: page.url,
-        headers: headerEntriesToFacade([["content-type", page.contentType]])
-      },
-      page.bodyText || ""
-    );
+    await waitForReleaseAuthBootstrap(tabId);
   } catch (err) {
-    logReleaseNavigationFailure(url, tab && tab.id, page || err.page, err);
-    preserveTab = Boolean(tab && shouldKeepFailedAuthBridgeTabs());
-    throw err;
-  } finally {
-    if (tab && tab.id !== undefined && !preserveTab) {
-      await tabsRemove(tab.id);
-    }
+    const failure = createAuthBridgeFailureError(releaseHubUrl, tabId, err.page, err);
+    logAuthBridgeFailure(failure);
+    await removeFailedAuthBridgeTab(tabId);
+    authBridgeTabs.delete(releaseHubUrl);
+    throw failure;
   }
 }
 
-function fetchJsonViaNavigation(url) {
-  const result = navigationFetchQueue.then(
-    () => fetchJsonViaNavigationNow(url),
-    () => fetchJsonViaNavigationNow(url)
+function getReleaseProjectName(url) {
+  const pathParts = new URL(url).pathname.split("/").filter(Boolean);
+  if (pathParts.length < 2) {
+    return "";
+  }
+  try {
+    return decodeURIComponent(pathParts[1]);
+  } catch (err) {
+    return "";
+  }
+}
+
+function startReleaseAuthBootstrap(projectName) {
+  releaseAuthBootstrapProjectName = projectName;
+  releaseAuthBootstrapPromise = bootstrapReleaseAuth(projectName)
+    .then(async () => {
+      releaseAuthProjectName = projectName;
+      await persistReleaseAuthProject(projectName).catch((err) => {
+        console.error("Failed to save Azure DevOps Release auth project:", err);
+      });
+      return projectName;
+    })
+    .catch((err) => {
+      if (releaseAuthProjectName === projectName) {
+        releaseAuthProjectName = "";
+      }
+      releaseAuthBootstrapPromise = null;
+      releaseAuthBootstrapProjectName = "";
+      console.error("[Azure DevOps release bootstrap]", {
+        projectName,
+        message: err && err.message ? err.message : String(err)
+      });
+      throw err;
+    });
+  return releaseAuthBootstrapPromise;
+}
+
+async function ensureReleaseAuthBootstrap(candidateProjectName) {
+  const projectName = releaseAuthProjectName || candidateProjectName;
+  if (!projectName) {
+    throw new Error("No Azure DevOps Classic Release project is available.");
+  }
+
+  if (!releaseAuthBootstrapPromise) {
+    startReleaseAuthBootstrap(projectName);
+  }
+
+  const attemptedProjectName = releaseAuthBootstrapProjectName;
+  try {
+    return await releaseAuthBootstrapPromise;
+  } catch (err) {
+    if (candidateProjectName && candidateProjectName !== attemptedProjectName) {
+      return ensureReleaseAuthBootstrap(candidateProjectName);
+    }
+    throw err;
+  }
+}
+
+async function fetchReleaseApprovalsFromPage(url) {
+  try {
+    const requestUrl = new URL(url);
+    const pathParts = requestUrl.pathname.split("/").filter(Boolean);
+    const projectName = decodeURIComponent(pathParts[1] || "");
+    const query = requestUrl.searchParams;
+    const topValue = Number(query.get("top"));
+    const top = Number.isFinite(topValue) && topValue > 0 ? topValue : undefined;
+    const releaseIds = query.get("releaseIdsFilter");
+    const releaseIdsFilter = releaseIds
+      ? releaseIds.split(",").map(Number).filter(Number.isFinite)
+      : undefined;
+    const includeMyGroupApprovals = query.has("includeMyGroupApprovals")
+      ? query.get("includeMyGroupApprovals") === "true"
+      : undefined;
+    const platformModule = window.require("VSS/Platform");
+    const releaseModule = window.require("Release/Client");
+    const releaseService = platformModule.Context.getService("IReleaseService");
+    const releaseClient = releaseService.pageContext.getRestClient(
+      releaseModule.RestClientRelease.ReleaseClientName
+    );
+    const result = await releaseClient.getApprovals(
+      projectName,
+      query.get("assignedToFilter") || undefined,
+      query.get("statusFilter") || undefined,
+      releaseIdsFilter,
+      query.get("typeFilter") || undefined,
+      top,
+      query.get("continuationToken") || undefined,
+      query.get("queryOrder") || undefined,
+      includeMyGroupApprovals
+    );
+    const approvals = Array.isArray(result)
+      ? result
+      : result && Array.isArray(result.value)
+        ? result.value
+        : [];
+
+    return {
+      approvals,
+      continuationToken: result && result.continuationToken
+        ? String(result.continuationToken)
+        : ""
+    };
+  } catch (err) {
+    const status = Number(err && err.status);
+    return {
+      bridgeError: {
+        name: err && err.name ? err.name : "Error",
+        message: err && err.message ? err.message : String(err),
+        status: Number.isFinite(status) ? status : null
+      }
+    };
+  }
+}
+
+function createReleaseClientError(url, bridgeError) {
+  if (bridgeError.status === 203 || bridgeError.status === 401) {
+    return createLoginRequiredError(url);
+  }
+
+  const err = new Error(
+    `Azure DevOps Release client failed for ${url}: ${bridgeError.message}`
   );
-  navigationFetchQueue = result.catch(() => {});
-  return result;
+  err.status = bridgeError.status || undefined;
+  err.url = url;
+  return err;
 }
 
 async function fetchReleaseJson(url) {
   if (!canUseAuthBridge()) {
     return fetchJsonDirect(url);
   }
-  return fetchJsonViaNavigation(url);
+
+  const projectName = getReleaseProjectName(url);
+  const bridgeProjectName = await ensureReleaseAuthBootstrap(projectName);
+  const tabId = await getAuthBridgeTabIdForPage(buildReleaseHubUrl(bridgeProjectName));
+  const results = await executeAuthBridgeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: fetchReleaseApprovalsFromPage,
+    args: [url]
+  }, url);
+  const fetchResult = results && results[0] ? results[0].result : null;
+  if (!fetchResult) {
+    throw new Error(`No response from Azure DevOps Release client for ${url}`);
+  }
+  if (fetchResult.bridgeError) {
+    throw createReleaseClientError(url, fetchResult.bridgeError);
+  }
+
+  const continuationToken = fetchResult.continuationToken || "";
+  return {
+    data: {
+      count: fetchResult.approvals.length,
+      value: fetchResult.approvals
+    },
+    response: {
+      ok: true,
+      status: 200,
+      url,
+      headers: headerEntriesToFacade([
+        ["content-type", "application/json"],
+        ["x-ms-continuationtoken", continuationToken]
+      ])
+    }
+  };
 }
 
 async function fetchJson(url) {
@@ -1237,24 +1547,29 @@ function renderNoApprovalsMessage() {
 }
 
 function renderFatalError(message) {
+  clearNotice("cacheNotice");
+  clearNotice("authNotice");
   const contentContainer = document.getElementById("contentContainer");
   contentContainer.innerHTML = "";
   contentContainer.appendChild(h("div", { className: "error-message" }, message));
 }
 
 function renderLoginRequiredMessage() {
+  clearNotice("cacheNotice");
+  clearNotice("authNotice");
   const contentContainer = document.getElementById("contentContainer");
   contentContainer.innerHTML = "";
   const loginUrl = appConfig && appConfig.org
     ? `https://dev.azure.com/${appConfig.org}/`
     : "https://dev.azure.com/";
-  const loginLink = h("a", { href: loginUrl, target: "_blank", className: "release-link" }, "登入");
+  const loginLink = h("a", { href: loginUrl, target: "_blank", className: "login-link" }, "登入");
   contentContainer.appendChild(
     h(
       "div",
       { className: "error-message" },
-      "存取 API 錯誤，請確認權限或嘗試重新",
-      loginLink
+      "需要登入 Azure DevOps，請先",
+      loginLink,
+      "後再按 Refresh。"
     )
   );
 }
@@ -1263,6 +1578,8 @@ function renderLoading() {
   const tabContainer = document.getElementById("tabContainer");
   const contentContainer = document.getElementById("contentContainer");
   currentMyApprovalUrls = [];
+  clearNotice("cacheNotice");
+  clearNotice("authNotice");
   tabContainer.innerHTML = "";
   contentContainer.innerHTML = "";
   contentContainer.appendChild(h("div", { className: "status-message" }, "Loading approvals..."));
@@ -1277,9 +1594,11 @@ function setRefreshButtonLoading(isLoading) {
   refreshButton.textContent = isLoading ? "Refreshing..." : "Refresh";
 }
 
-function renderApprovalsResults(projectsWithApprovals, savedAt) {
+function renderApprovalsResults(projectsWithApprovals, savedAt, fromCache = false) {
   renderedAt = savedAt || Date.now();
   updateOrgLabel();
+  updateCacheNotice(renderedAt, fromCache);
+  clearNotice("authNotice");
 
   if (projectsWithApprovals.length === 0) {
     renderNoApprovalsMessage();
@@ -1397,10 +1716,11 @@ async function loadApprovals(forceRefresh = false) {
       return;
     }
 
+    const cache = await loadApprovalsCache();
+    await initializeReleaseAuthProject(cache);
     if (!forceRefresh) {
-      const cache = await loadApprovalsCache();
       if (cache) {
-        renderApprovalsResults(cache.results, cache.savedAt);
+        renderApprovalsResults(cache.results, cache.savedAt, true);
         if (isCacheSavedToday(cache)) {
           return;
         }
@@ -1421,7 +1741,11 @@ async function loadApprovals(forceRefresh = false) {
 
     if (projectsWithApprovals.length === 0) {
       if (hasLoginError) {
-        renderLoginRequiredMessage();
+        if (renderedCachedResults && !forceRefresh) {
+          renderLoginRequiredNotice();
+        } else {
+          renderLoginRequiredMessage();
+        }
         return;
       }
       const savedAt = Date.now();
@@ -1440,6 +1764,9 @@ async function loadApprovals(forceRefresh = false) {
   } catch (err) {
     console.error(err);
     if (renderedCachedResults && !forceRefresh) {
+      if (isLoginRequiredError(err)) {
+        renderLoginRequiredNotice();
+      }
       return;
     }
     if (isLoginRequiredError(err)) {
